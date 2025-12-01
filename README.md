@@ -5,7 +5,7 @@ Lightweight country-based CAPTCHA gate intended for `auto_prepend_file`. If some
 ## How it works
 
 1. The script resolves the visitor IP (supports `HTTP_CF_CONNECTING_IP`, `X-Forwarded-For`, etc.).
-2. Country resolution first checks a local GeoIP CSV database, then an HTTP endpoint. Results are cached in `var/state.json`.
+2. Country resolution first checks a local MaxMind MMDB database, then a local HTTP resolver, and finally a public HTTP endpoint. Results are cached in `var/state.json`.
 3. Allowed countries skip the CAPTCHA entirely. Other countries must solve it. Repeated failures lead to a temporary ban.
 4. Bans, attempts, and Geo cache entries are purged lazily in the background or via a CLI task.
 5. Every operation is intentionally lightweight: minimal I/O, no Composer dependencies, works from PHP 5.6 to 8.4.
@@ -34,8 +34,10 @@ The file returns an associative array. Notable options:
 - `geo_cache_ttl`: cache duration for GeoIP responses (seconds).
 - `storage_path`: directory for runtime files (state, cache, local DB).
 - `purge_probability`: probability (0–1) to purge expired entries on each request.
-- `geo_endpoint`: HTTP service used for remote GeoIP lookups (`%s` is replaced by the IP).
-- `local_geo_db`: path to a local CSV database used **before** remote lookups. Format: one CIDR + country per line, e.g. `8.8.8.0/24;US`.
+- `mmdb_path`: optional path to a MaxMind MMDB file (e.g., GeoLite2-Country). When present and readable, it is queried **before** any HTTP request.
+- `geo_local_endpoint`: HTTP service on the local network that returns JSON. Expected response: `{"result":{"country":"AU"},"return":true}`.
+- `geo_endpoint`: secondary public HTTP service for remote GeoIP lookups (`%s` is replaced by the IP). Should return the country code as plain text.
+- `local_geo_db`: legacy local CSV database used after the MMDB (kept for compatibility). Format: one CIDR + country per line, e.g. `8.8.8.0/24;US`.
 - `local_geo_update_url`: optional URL to refresh `local_geo_db` (same format as above).
 - `log_file`: target log file.
 - `log_level`: `debug`, `info`, or `error`.
@@ -56,7 +58,15 @@ php prepend.php update-geo-db     # download the local GeoIP DB from local_geo_u
 
 Tasks are no-ops when the related configuration is missing. They are safe to run from cron.
 
-## Local GeoIP database
+## Local GeoIP databases
+
+### MMDB (recommended)
+
+- Download a country-level MMDB such as **GeoLite2 Country** from MaxMind (requires a free account) or another compatible source.
+- Place the file at the configured `mmdb_path` (default: `var/GeoLite2-Country.mmdb`).
+- The script will automatically use the MMDB when readable; otherwise it falls back to the HTTP endpoints.
+
+### CSV (legacy fallback)
 
 - Provide a small CSV in the format `CIDR;COUNTRY` (semicolon, comma, or whitespace separated). Example:
   ```

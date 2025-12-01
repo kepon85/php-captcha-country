@@ -21,8 +21,13 @@ return array(
     // Probability for running background purge on each request (0-1)
     'purge_probability' => 0.15,
 
-    // HTTP service used to resolve countries. "%s" is replaced by the IP address
-    // The endpoint should return the country code as plain text
+    // Optional MaxMind MMDB (GeoLite2 Country, etc.). If present, used before any HTTP lookup
+    'mmdb_path' => __DIR__ . '/var/GeoLite2-Country.mmdb',
+
+    // Local intranet HTTP service used to resolve countries (returns JSON)
+    'geo_local_endpoint' => 'https://tools.bibliossimo.info/whois/api.php?ip=%s',
+
+    // Secondary public HTTP service (plain text country code)
     'geo_endpoint' => 'https://ipapi.co/%s/country/',
 
     // Local GeoIP database (CIDR;COUNTRY) used before remote lookups

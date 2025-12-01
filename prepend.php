@@ -212,11 +212,110 @@ function guard_geo_local_lookup($ip, $config)
     return '';
 }
 
+function guard_geo_mmdb_lookup($ip, $config)
+{
+    if (empty($config['mmdb_path']) || !is_readable($config['mmdb_path'])) {
+        return '';
+    }
+    if (!function_exists('maxminddb_open') || !function_exists('maxminddb_get_record')) {
+        return '';
+    }
+    $db = @maxminddb_open($config['mmdb_path']);
+    if (!$db) {
+        return '';
+    }
+    $record = @maxminddb_get_record($db, $ip);
+    if (function_exists('maxminddb_close')) {
+        @maxminddb_close($db);
+    }
+    if (!is_array($record)) {
+        return '';
+    }
+    if (isset($record['country']['iso_code'])) {
+        return strtoupper($record['country']['iso_code']);
+    }
+    if (isset($record['registered_country']['iso_code'])) {
+        return strtoupper($record['registered_country']['iso_code']);
+    }
+    return '';
+}
+
+function guard_geo_http_get($endpoint, $timeout)
+{
+    $response = false;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($endpoint);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+        $response = curl_exec($ch);
+        curl_close($ch);
+    }
+    if ($response === false) {
+        $context = stream_context_create(array('http' => array('timeout' => $timeout)));
+        $response = @file_get_contents($endpoint, false, $context);
+    }
+    return $response;
+}
+
+function guard_geo_local_api_lookup($ip, $config)
+{
+    if (empty($config['geo_local_endpoint'])) {
+        return '';
+    }
+    $endpoint = sprintf($config['geo_local_endpoint'], urlencode($ip));
+    $response = guard_geo_http_get($endpoint, 5);
+    if ($response === false || trim($response) === '') {
+        return '';
+    }
+    $data = json_decode($response, true);
+    if (!is_array($data) || !isset($data['return']) || !$data['return']) {
+        return '';
+    }
+    if (isset($data['result']['country'])) {
+        return strtoupper(trim($data['result']['country']));
+    }
+    return '';
+}
+
+function guard_geo_public_lookup($ip, $config)
+{
+    if (empty($config['geo_endpoint'])) {
+        return '';
+    }
+    $endpoint = sprintf($config['geo_endpoint'], urlencode($ip));
+    $response = guard_geo_http_get($endpoint, 5);
+    return $response ? strtoupper(trim($response)) : '';
+}
+
 function guard_geo_lookup($ip, &$state, $config)
 {
     $now = time();
     if (isset($state['geo'][$ip]) && isset($state['geo'][$ip]['country']) && isset($state['geo'][$ip]['expires_at']) && $state['geo'][$ip]['expires_at'] > $now) {
         return $state['geo'][$ip]['country'];
+    }
+
+    $country = guard_geo_mmdb_lookup($ip, $config);
+    if ($country !== '') {
+        $state['geo'][$ip] = array('country' => $country, 'expires_at' => $now + $config['geo_cache_ttl']);
+        guard_write_state(guard_state_file($config), $state);
+        return $country;
+    }
+
+    $country = guard_geo_local_api_lookup($ip, $config);
+    if ($country !== '') {
+        $state['geo'][$ip] = array('country' => $country, 'expires_at' => $now + $config['geo_cache_ttl']);
+        guard_write_state(guard_state_file($config), $state);
+        return $country;
+    }
+
+    $country = guard_geo_public_lookup($ip, $config);
+    if ($country !== '') {
+        $state['geo'][$ip] = array(
+            'country' => $country,
+            'expires_at' => $now + $config['geo_cache_ttl'],
+        );
+        guard_write_state(guard_state_file($config), $state);
+        return $country;
     }
 
     $country = guard_geo_local_lookup($ip, $config);
@@ -225,29 +324,7 @@ function guard_geo_lookup($ip, &$state, $config)
         guard_write_state(guard_state_file($config), $state);
         return $country;
     }
-
-    $endpoint = sprintf($config['geo_endpoint'], urlencode($ip));
-    $response = false;
-    if (function_exists('curl_init')) {
-        $ch = curl_init($endpoint);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-        $response = curl_exec($ch);
-        curl_close($ch);
-    }
-    if ($response === false) {
-        $context = stream_context_create(array('http' => array('timeout' => 5)));
-        $response = @file_get_contents($endpoint, false, $context);
-    }
-    $country = $response ? strtoupper(trim($response)) : '';
-    if ($country !== '') {
-        $state['geo'][$ip] = array(
-            'country' => $country,
-            'expires_at' => $now + $config['geo_cache_ttl'],
-        );
-        guard_write_state(guard_state_file($config), $state);
-    }
-    return $country;
+    return '';
 }
 
 function guard_show_ban($config)
@@ -310,19 +387,33 @@ function guard_render_captcha_form($config, $error)
     http_response_code(403);
     echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>';
     echo htmlspecialchars($config['strings']['captcha_title'], ENT_QUOTES, 'UTF-8');
-    echo '</title></head><body style="font-family: Arial, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #f7f7f7;">';
-    echo '<div style="background: white; padding: 20px 30px; border: 1px solid #ddd; box-shadow: 0 2px 6px rgba(0,0,0,0.06);">';
-    echo '<h2 style="margin-top:0;">' . htmlspecialchars($config['strings']['captcha_title'], ENT_QUOTES, 'UTF-8') . '</h2>';
+    echo '</title><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">';
+    echo '<style>body{background:#f4f6fb;} .captcha-card{max-width:420px;} .captcha-frame{background:#f8fafc;border:1px solid #e5e9f0;border-radius:10px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,0.08);} .captcha-label{font-weight:600;color:#0f172a;} .captcha-footer{color:#64748b;font-size:13px;} .badge-soft{background: linear-gradient(135deg,#0ea5e9,#6366f1); color:#fff;} </style>';
+    echo '</head><body class="d-flex align-items-center justify-content-center min-vh-100">';
+    echo '<div class="captcha-card w-100">';
+    echo '<div class="captcha-frame">';
+    echo '<div class="d-flex align-items-center mb-3">';
+    echo '<div class="badge badge-soft me-2 px-3 py-2 rounded-pill">Je ne suis pas un robot</div>';
+    echo '<div class="text-muted small">Protection allégée façon Cloudflare</div>';
+    echo '</div>';
+    echo '<h4 class="mb-3">' . htmlspecialchars($config['strings']['captcha_title'], ENT_QUOTES, 'UTF-8') . '</h4>';
     if ($error) {
-        echo '<p style="color: #c00;">' . htmlspecialchars($config['strings']['captcha_error'], ENT_QUOTES, 'UTF-8') . '</p>';
+        echo '<div class="alert alert-danger" role="alert">' . htmlspecialchars($config['strings']['captcha_error'], ENT_QUOTES, 'UTF-8') . '</div>';
     }
-    echo '<form method="post">';
-    echo '<p><img src="?__captcha_image=1&amp;_ts=' . time() . '" alt="CAPTCHA"></p>';
-    echo '<label>' . htmlspecialchars($config['strings']['captcha_label'], ENT_QUOTES, 'UTF-8') . '</label><br>';
-    echo '<input type="text" name="__captcha_value" autocomplete="off" required style="padding:8px; width:160px; margin-top:6px;">';
-    echo '<div style="margin-top:10px;"><button type="submit" style="padding:8px 14px;">' . htmlspecialchars($config['strings']['captcha_button'], ENT_QUOTES, 'UTF-8') . '</button></div>';
+    echo '<form method="post" class="mt-3">';
+    echo '<div class="mb-3 text-center">';
+    echo '<img src="?__captcha_image=1&amp;_ts=' . time() . '" alt="CAPTCHA" class="img-fluid rounded" style="box-shadow:0 4px 16px rgba(0,0,0,0.08);">';
+    echo '</div>';
+    echo '<div class="mb-3">';
+    echo '<label class="form-label captcha-label">' . htmlspecialchars($config['strings']['captcha_label'], ENT_QUOTES, 'UTF-8') . '</label>';
+    echo '<input type="text" name="__captcha_value" autocomplete="off" required class="form-control form-control-lg" placeholder="Code sécurisé">';
+    echo '</div>';
+    echo '<div class="d-grid">';
+    echo '<button type="submit" class="btn btn-primary btn-lg">' . htmlspecialchars($config['strings']['captcha_button'], ENT_QUOTES, 'UTF-8') . '</button>';
+    echo '</div>';
+    echo '<p class="captcha-footer mt-3 mb-0">Défi léger pour décourager les crawlers et IA opportunistes.</p>';
     echo '</form>';
-    echo '</div></body></html>';
+    echo '</div></div></body></html>';
     exit;
 }
 
