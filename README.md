@@ -1,59 +1,79 @@
 # php-captcha-country
 
-Protection légère qui affiche un CAPTCHA aux visiteurs en dehors d'une liste de pays autorisés avant de charger votre application. Pensée pour `auto_prepend_file` afin de filtrer chaque requête sans dépendances externes.
+Lightweight country-based CAPTCHA gate intended for `auto_prepend_file`. If something is misconfigured, the IP cannot be resolved, or a lookup fails, the request is **never blocked**: the code simply steps aside and your application keeps running.
 
-## Fonctionnement
+## How it works
 
-1. Le script identifie l'adresse IP (supporte `HTTP_CF_CONNECTING_IP`, `X-Forwarded-For`, etc.).
-2. La géolocalisation du pays est récupérée via un service HTTP configurable puis mise en cache dans `var/state.json`.
-3. Si le pays est autorisé, la requête continue normalement.
-4. Sinon un CAPTCHA (image PNG avec GD, ou texte si GD indisponible) est affiché. En cas d'échec répétitif, l'IP est bannie temporairement.
-5. Les bannissements, tentatives et cache Geo sont purgés automatiquement en arrière-plan.
-
-Compatible PHP 5.6 à 8.4, sans Composer.
+1. The script resolves the visitor IP (supports `HTTP_CF_CONNECTING_IP`, `X-Forwarded-For`, etc.).
+2. Country resolution first checks a local GeoIP CSV database, then an HTTP endpoint. Results are cached in `var/state.json`.
+3. Allowed countries skip the CAPTCHA entirely. Other countries must solve it. Repeated failures lead to a temporary ban.
+4. Bans, attempts, and Geo cache entries are purged lazily in the background or via a CLI task.
+5. Every operation is intentionally lightweight: minimal I/O, no Composer dependencies, works from PHP 5.6 to 8.4.
 
 ## Installation
 
-1. Copier le dépôt sur votre serveur.
-2. Vérifier que le répertoire `var/` est inscriptible par PHP (fichier d'état et cache).
-3. (Optionnel) Activer GD pour obtenir une image CAPTCHA plus lisible.
-4. Ajouter dans votre `php.ini` ou configuration virtuelle :
+1. Copy the repository to your server.
+2. Ensure the `var/` directory is writable by PHP (state, cache, and logs).
+3. (Optional) Enable GD for nicer CAPTCHA images; otherwise a plain-text fallback is used.
+4. Add to your PHP configuration:
 
 ```ini
-auto_prepend_file="/chemin/vers/prepend.php"
+auto_prepend_file="/path/to/prepend.php"
 ```
 
-5. Adapter la configuration si nécessaire (voir ci-dessous).
+5. Adjust the configuration (see below). If the configuration file is missing or invalid, the guard silently bypasses itself.
 
 ## Configuration (`config.php`)
 
-Le fichier renvoie un tableau associatif :
+The file returns an associative array. Notable options:
 
-- `allowed_countries` : codes pays autorisés sans CAPTCHA (ex. `array('FR', 'DE')`).
-- `ban_duration` : durée du bannissement en secondes après trop d'échecs.
-- `failed_attempt_limit` : nombre d'échecs CAPTCHA avant le bannissement.
-- `captcha_ttl` : durée de validité du code généré (secondes).
-- `geo_cache_ttl` : durée de cache pour la géolocalisation IP.
-- `storage_path` : répertoire pour `state.json` (bans, cache, tentatives).
-- `purge_probability` : probabilité (0-1) de purger les entrées expirées à chaque requête.
-- `geo_endpoint` : URL du service retournant le code pays ( `%s` remplacé par l'IP ).
-- `strings` : personnalisation des textes affichés.
+- `allowed_countries`: ISO 3166-1 alpha-2 codes that bypass the CAPTCHA.
+- `ban_duration`: seconds before a banned IP is released.
+- `failed_attempt_limit`: failed CAPTCHA attempts before banning.
+- `captcha_ttl`: validity window for a generated CAPTCHA (seconds).
+- `geo_cache_ttl`: cache duration for GeoIP responses (seconds).
+- `storage_path`: directory for runtime files (state, cache, local DB).
+- `purge_probability`: probability (0–1) to purge expired entries on each request.
+- `geo_endpoint`: HTTP service used for remote GeoIP lookups (`%s` is replaced by the IP).
+- `local_geo_db`: path to a local CSV database used **before** remote lookups. Format: one CIDR + country per line, e.g. `8.8.8.0/24;US`.
+- `local_geo_update_url`: optional URL to refresh `local_geo_db` (same format as above).
+- `log_file`: target log file.
+- `log_level`: `debug`, `info`, or `error`.
+- `log_max_bytes`: truncate/overwrite the log when it exceeds this size.
+- `strings`: customizable UI texts.
 
-## Personnalisation rapide
+If an IP cannot be resolved, the Geo lookup fails, or any runtime error happens, the code logs (according to the configured level) and **bypasses the CAPTCHA** to avoid accidental blocking.
 
-- **Pays autorisés** : modifiez `allowed_countries`.
-- **Durée de bannissement** : ajustez `ban_duration`.
-- **Seuil d'échec** : ajustez `failed_attempt_limit`.
-- **Service GeoIP** : changez `geo_endpoint` (doit répondre avec un code pays, ex. `https://ifconfig.co/country-iso` avec `%s`).
-- **Messages** : éditez les valeurs du tableau `strings`.
+## CLI maintenance tasks
 
-## Notes techniques
+You can call the prepend file directly to run maintenance without hitting the web flow:
 
-- Les sessions sont utilisées pour suivre la résolution du CAPTCHA par IP.
-- Sans extension GD, le code est affiché en clair dans l'image (fallback texte) afin d'éviter les dépendances.
-- Les requêtes CLI retournent immédiatement et ne modifient pas l'état.
-- Le fichier `var/state.json` est verrouillé avec `flock` lorsque disponible pour limiter les courses concurrentes.
+```bash
+php prepend.php purge-cache       # purge expired bans/attempts/cache
+php prepend.php clear-geo-cache   # clear only Geo cache
+php prepend.php update-geo-db     # download the local GeoIP DB from local_geo_update_url
+```
 
-## Désinstallation
+Tasks are no-ops when the related configuration is missing. They are safe to run from cron.
 
-Supprimez la directive `auto_prepend_file` et effacez le répertoire du projet (`var/state.json` peut être supprimé sans risque).
+## Local GeoIP database
+
+- Provide a small CSV in the format `CIDR;COUNTRY` (semicolon, comma, or whitespace separated). Example:
+  ```
+  8.8.8.0/24;US
+  1.1.1.0/24 AU
+  ```
+- Lines starting with `#` are ignored.
+- The database is loaded once per request and kept in memory for speed. Cache hits are also written to `var/state.json`.
+
+## Logging
+
+`guard_log` writes timestamped lines with level filtering. When `log_max_bytes` is exceeded, the file is truncated before the next write. Levels:
+
+- `debug`: verbose internal messages.
+- `info`: high-level events (e.g., Geo fallback).
+- `error`: serious issues (e.g., missing IP).
+
+## Uninstall
+
+Remove the `auto_prepend_file` directive and delete the project directory (including `var/state.json` and any downloaded GeoIP DB).

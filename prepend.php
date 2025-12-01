@@ -1,11 +1,44 @@
 <?php
 // Lightweight country-based CAPTCHA gate for auto_prepend_file
 
-if (php_sapi_name() === 'cli') {
-    return;
+function guard_load_config($path)
+{
+    if (!file_exists($path)) {
+        return null;
+    }
+    $config = require $path;
+    if (!is_array($config)) {
+        return null;
+    }
+    return $config;
 }
 
-$config = require __DIR__ . '/config.php';
+function guard_log($config, $level, $message)
+{
+    $levelMap = array('debug' => 0, 'info' => 1, 'error' => 2);
+    $configuredLevel = isset($config['log_level']) ? strtolower($config['log_level']) : 'info';
+    if (!isset($levelMap[$configuredLevel]) || !isset($levelMap[$level])) {
+        return;
+    }
+    if ($levelMap[$level] < $levelMap[$configuredLevel]) {
+        return;
+    }
+
+    $file = isset($config['log_file']) ? $config['log_file'] : null;
+    $maxBytes = isset($config['log_max_bytes']) ? (int) $config['log_max_bytes'] : 0;
+    if (!$file) {
+        return;
+    }
+    $dir = dirname($file);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0775, true);
+    }
+    if ($maxBytes > 0 && file_exists($file) && filesize($file) > $maxBytes) {
+        @file_put_contents($file, '');
+    }
+    $line = sprintf("%s [%s] %s\n", date('c'), strtoupper($level), $message);
+    @file_put_contents($file, $line, FILE_APPEND);
+}
 
 function guard_get_client_ip()
 {
@@ -20,7 +53,7 @@ function guard_get_client_ip()
             return $value;
         }
     }
-    return '0.0.0.0';
+    return '';
 }
 
 function guard_state_file($config)
@@ -81,7 +114,7 @@ function guard_write_state($file, $state)
     fclose($handle);
 }
 
-function guard_purge(&$state, $config)
+function guard_purge(&$state, $config, $forceWrite = false)
 {
     $now = time();
     foreach (array('bans', 'geo', 'attempts') as $section) {
@@ -92,9 +125,91 @@ function guard_purge(&$state, $config)
             }
         }
     }
-    if ($config['purge_probability'] > 0 && mt_rand() / mt_getrandmax() <= $config['purge_probability']) {
+    $shouldWrite = $forceWrite;
+    if (!$shouldWrite && $config['purge_probability'] > 0 && mt_rand() / mt_getrandmax() <= $config['purge_probability']) {
+        $shouldWrite = true;
+    }
+    if ($shouldWrite) {
         guard_write_state(guard_state_file($config), $state);
     }
+}
+
+function guard_update_local_db($config)
+{
+    if (empty($config['local_geo_update_url']) || empty($config['local_geo_db'])) {
+        return false;
+    }
+    $url = $config['local_geo_update_url'];
+    $data = false;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        $data = curl_exec($ch);
+        curl_close($ch);
+    }
+    if ($data === false) {
+        $context = stream_context_create(array('http' => array('timeout' => 10)));
+        $data = @file_get_contents($url, false, $context);
+    }
+    if ($data === false || trim($data) === '') {
+        return false;
+    }
+    $dir = dirname($config['local_geo_db']);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0775, true);
+    }
+    return @file_put_contents($config['local_geo_db'], $data) !== false;
+}
+
+function guard_geo_local_lookup($ip, $config)
+{
+    if (empty($config['local_geo_db']) || !file_exists($config['local_geo_db'])) {
+        return '';
+    }
+    static $localCache = null;
+    if ($localCache === null) {
+        $localCache = array();
+        $handle = @fopen($config['local_geo_db'], 'r');
+        if ($handle) {
+            while (($line = fgets($handle)) !== false) {
+                $line = trim($line);
+                if ($line === '' || strpos($line, '#') === 0) {
+                    continue;
+                }
+                $parts = preg_split('/[;,\s]+/', $line);
+                if (count($parts) < 2) {
+                    continue;
+                }
+                $cidr = $parts[0];
+                $country = strtoupper(trim($parts[1]));
+                $segments = explode('/', $cidr);
+                if (count($segments) !== 2) {
+                    continue;
+                }
+                $base = ip2long($segments[0]);
+                $mask = (int) $segments[1];
+                if ($base === false || $mask < 0 || $mask > 32) {
+                    continue;
+                }
+                $range = pow(2, 32 - $mask);
+                $start = $base & ~($range - 1);
+                $end = $start + $range - 1;
+                $localCache[] = array('start' => $start, 'end' => $end, 'country' => $country);
+            }
+            fclose($handle);
+        }
+    }
+    $longIp = ip2long($ip);
+    if ($longIp === false) {
+        return '';
+    }
+    foreach ($localCache as $entry) {
+        if ($longIp >= $entry['start'] && $longIp <= $entry['end']) {
+            return $entry['country'];
+        }
+    }
+    return '';
 }
 
 function guard_geo_lookup($ip, &$state, $config)
@@ -103,6 +218,14 @@ function guard_geo_lookup($ip, &$state, $config)
     if (isset($state['geo'][$ip]) && isset($state['geo'][$ip]['country']) && isset($state['geo'][$ip]['expires_at']) && $state['geo'][$ip]['expires_at'] > $now) {
         return $state['geo'][$ip]['country'];
     }
+
+    $country = guard_geo_local_lookup($ip, $config);
+    if ($country !== '') {
+        $state['geo'][$ip] = array('country' => $country, 'expires_at' => $now + $config['geo_cache_ttl']);
+        guard_write_state(guard_state_file($config), $state);
+        return $country;
+    }
+
     $endpoint = sprintf($config['geo_endpoint'], urlencode($ip));
     $response = false;
     if (function_exists('curl_init')) {
@@ -210,21 +333,59 @@ function guard_session_start()
     }
 }
 
-$stateFile = guard_state_file($config);
-$state = guard_read_state($stateFile);
-guard_purge($state, $config);
+function guard_run_cli($config, $argv)
+{
+    if (count($argv) < 2) {
+        return;
+    }
+    $command = $argv[1];
+    $stateFile = guard_state_file($config);
+    if ($command === 'purge-cache') {
+        $state = guard_read_state($stateFile);
+        guard_purge($state, $config, true);
+        echo "Expired entries purged.\n";
+    } elseif ($command === 'clear-geo-cache') {
+        $state = guard_read_state($stateFile);
+        $state['geo'] = array();
+        guard_write_state($stateFile, $state);
+        echo "Geo cache cleared.\n";
+    } elseif ($command === 'update-geo-db') {
+        $ok = guard_update_local_db($config);
+        echo $ok ? "Local GeoIP database refreshed.\n" : "Failed to refresh local GeoIP database.\n";
+    }
+}
+
+$config = guard_load_config(__DIR__ . '/config.php');
+if (!is_array($config)) {
+    return;
+}
+
+if (php_sapi_name() === 'cli') {
+    guard_run_cli($config, isset($argv) ? $argv : array());
+    return;
+}
 
 $ip = guard_get_client_ip();
-$now = time();
+if ($ip === '') {
+    guard_log($config, 'error', 'Unable to resolve client IP. Bypassing CAPTCHA.');
+    return;
+}
+
+$stateFile = guard_state_file($config);
+$state = guard_read_state($stateFile);
 
 // Serve captcha image when requested
 if (isset($_GET['__captcha_image'])) {
     guard_session_start();
     $code = guard_generate_captcha_code();
     $_SESSION['captcha_code'] = $code;
-    $_SESSION['captcha_created_at'] = $now;
+    $_SESSION['captcha_created_at'] = time();
     guard_output_captcha_image($code);
 }
+
+guard_purge($state, $config);
+
+$now = time();
 
 // Check active bans
 if (isset($state['bans'][$ip]) && isset($state['bans'][$ip]['expires_at']) && $state['bans'][$ip]['expires_at'] > $now) {
@@ -232,7 +393,12 @@ if (isset($state['bans'][$ip]) && isset($state['bans'][$ip]['expires_at']) && $s
 }
 
 $country = guard_geo_lookup($ip, $state, $config);
-if ($country && in_array($country, $config['allowed_countries'])) {
+if ($country === '') {
+    guard_log($config, 'info', 'Geo lookup failed for ' . $ip . ', bypassing CAPTCHA.');
+    return;
+}
+
+if (in_array($country, $config['allowed_countries'])) {
     return;
 }
 

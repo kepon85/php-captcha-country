@@ -25,13 +25,24 @@ return array(
     // The endpoint should return the country code as plain text
     'geo_endpoint' => 'https://ipapi.co/%s/country/',
 
+    // Local GeoIP database (CIDR;COUNTRY) used before remote lookups
+    'local_geo_db' => __DIR__ . '/var/geoip_local.csv',
+
+    // Optional URL to refresh the local database (plain text in the same format)
+    'local_geo_update_url' => null,
+
+    // Log file options
+    'log_file' => __DIR__ . '/var/guard.log',
+    'log_level' => 'info', // debug, info, error
+    'log_max_bytes' => 524288, // 512 KB
+
     // Customize displayed HTML strings if needed
     'strings' => array(
-        'banned_title' => 'Accès refusé',
-        'banned_message' => "Votre IP a été bannie. Contactez l'administrateur.",
-        'captcha_title' => 'Vérification de sécurité',
-        'captcha_label' => 'Veuillez entrer le code',
-        'captcha_button' => 'Valider',
-        'captcha_error' => 'Code incorrect, veuillez réessayer.',
+        'banned_title' => 'Access denied',
+        'banned_message' => 'Your IP has been banned. Contact the administrator.',
+        'captcha_title' => 'Security check',
+        'captcha_label' => 'Please type the code',
+        'captcha_button' => 'Submit',
+        'captcha_error' => 'Incorrect code, please try again.',
     ),
 );
